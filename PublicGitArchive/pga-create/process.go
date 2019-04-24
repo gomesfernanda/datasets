@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -28,6 +29,7 @@ import (
 type repositoryData struct {
 	URL         string
 	SivaFiles   []string
+	Size        int64
 	Files       int
 	Languages   map[string]language
 	HEADCommits int64
@@ -35,6 +37,7 @@ type repositoryData struct {
 	Branches    int
 	Forks       int
 	License     map[string]float32
+	Stars       uint32
 }
 
 func (r repositoryData) toRecord() []string {
@@ -89,6 +92,8 @@ func (r repositoryData) toRecord() []string {
 		join(langCodeLines),       // "CODE_LINES_COUNT"
 		join(langCommentLines),    // "COMMENT_LINES_COUNT"
 		join(licenses),            // "LICENSE"
+		fmt.Sprint(r.Stars),       // "STARS"
+		fmt.Sprint(r.Size),        // "SIZE"
 	}
 }
 
@@ -111,6 +116,8 @@ var csvHeader = []string{
 	"CODE_LINES_COUNT",
 	"COMMENT_LINES_COUNT",
 	"LICENSE",
+	"STARS",
+	"SIZE",
 }
 
 type language struct {
@@ -128,6 +135,7 @@ func processRepos(
 	workers int,
 	txer repository.RootedTransactioner,
 	rs *model.RepositoryResultSet,
+	stars map[string]uint32,
 ) <-chan *repositoryData {
 	logrus.WithField("workers", runtime.NumCPU()).Info("start processing repos")
 	start := time.Now()
@@ -157,7 +165,7 @@ func processRepos(
 				log.Debug("starting worker")
 				defer log.Debug("stopping worker")
 
-				data, err := newProcessor(repo, txer, locker).process()
+				data, err := newProcessor(repo, txer, locker, stars).process()
 				if err == errNoHEAD {
 					log.WithField("repo", repo.ID).Warn("empty repository")
 					ch <- &repositoryData{
@@ -186,17 +194,20 @@ type processor struct {
 	dbRepo *model.Repository
 	txer   repository.RootedTransactioner
 	locker *locker
+	stars  map[string]uint32
 }
 
 func newProcessor(
 	dbRepo *model.Repository,
 	txer repository.RootedTransactioner,
 	locker *locker,
+	stars map[string]uint32,
 ) *processor {
 	return &processor{
 		dbRepo: dbRepo,
 		txer:   txer,
 		locker: locker,
+		stars:  stars,
 	}
 }
 
@@ -249,6 +260,7 @@ func (p *processor) process() (*repositoryData, error) {
 	_ = tx.Rollback()
 
 	log = log.WithField("url", data.URL)
+	var sumOfSivaSizes int64
 	for init := range inits {
 		log.WithField("init", init.String()).Debug("processing init")
 		mut := p.locker.lock(init.String())
@@ -265,6 +277,12 @@ func (p *processor) process() (*repositoryData, error) {
 			if err != nil {
 				return fmt.Errorf("can't open root repo: %s", err)
 			}
+
+			size, err := sivaSize(init.String())
+			if err != nil {
+				panic(err)
+			}
+			sumOfSivaSizes += size
 
 			iter, err := r.CommitObjects()
 			if err != nil {
@@ -311,6 +329,7 @@ func (p *processor) process() (*repositoryData, error) {
 	}
 
 	data.SivaFiles = sivaFiles(inits)
+	data.Size = sumOfSivaSizes
 
 	return data, nil
 }
@@ -393,7 +412,28 @@ func (p *processor) data() (*repositoryData, error) {
 			Warn("unable to get license for repository")
 	}
 
+	repo := trimRepoURL(data.URL)
+	data.Stars = p.stars[repo]
+
 	return &data, nil
+}
+
+func trimRepoURL(url string) string {
+	const (
+		HTTPprefix = "https://github.com/"
+		SSHprefix  = "git://github.com/"
+		suffix     = ".git"
+	)
+
+	var repo string
+	if strings.HasPrefix(url, HTTPprefix) {
+		repo = strings.TrimPrefix(url, HTTPprefix)
+	} else if strings.HasPrefix(url, SSHprefix) {
+		repo = strings.TrimPrefix(url, SSHprefix)
+		repo = strings.TrimSuffix(repo, suffix)
+	}
+
+	return repo
 }
 
 func (p *processor) head() (*plumbing.Reference, error) {
@@ -438,6 +478,81 @@ func sivaFiles(inits map[model.SHA1]struct{}) []string {
 	}
 	sort.Strings(files)
 	return files
+}
+
+// regex to match directory names composed by sha1_timestamp as in
+// 7a80dfe1684664cefd2923bdbb329dcb9a48dc4f_1551878586555302343
+var regSivaDir = regexp.MustCompile(`\b([0-9a-f]{40})_[0-9]{19}\b`)
+
+func sivaSize(init string) (int64, error) {
+	info, err := ioutil.ReadDir("/tmp/sourced")
+	if err != nil {
+		return -1, err
+	}
+
+	if len(info) != 1 || !info[0].IsDir() {
+		return -1, fmt.Errorf("/tmp/sourced directory wasn't in a clean status")
+	}
+
+	tmp := filepath.Join("/tmp/sourced", info[0].Name(), "transactioner")
+	info, err = ioutil.ReadDir(tmp)
+	if err != nil {
+		return -1, err
+	}
+
+	var paths []string
+	for _, fi := range info {
+		if !fi.IsDir() {
+			continue
+		}
+
+		matches := regSivaDir.FindStringSubmatch(fi.Name())
+		if len(matches) != 2 {
+			continue
+		}
+
+		if init == matches[1] {
+			path := filepath.Join(tmp, fi.Name(), "siva")
+			// the same siva file could be duplicated under
+			// different directories if there are several
+			// repositories being analyzed concurrently
+			paths = append(paths, path)
+		}
+	}
+
+	if len(paths) == 0 {
+		return -1, fmt.Errorf(
+			"couldn't find siva file for SHA1 %s in %s",
+			init, tmp)
+
+	}
+
+	var size int64 = -1
+	for _, path := range paths {
+		fi, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// a previous found siva file generated from
+				// another repository analysis could have been
+				// already removed
+				continue
+			}
+
+			return -1, err
+		}
+
+		if size < fi.Size() {
+			size = fi.Size()
+		}
+	}
+
+	if size < 0 {
+		return -1, fmt.Errorf(
+			"couldn't find siva file for SHA1 %s in %s",
+			init, tmp)
+	}
+
+	return size, nil
 }
 
 func mergeLanguageData(

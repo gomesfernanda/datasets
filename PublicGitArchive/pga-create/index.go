@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"encoding/csv"
+	"fmt"
 	"os"
 	"os/signal"
 
@@ -20,7 +21,7 @@ func Index(
 	workers int,
 	limit uint64,
 	offset uint64,
-	list []string,
+	reposList map[string]uint32,
 ) {
 	f, err := createOutputFile(outputFile)
 	if err != nil {
@@ -35,14 +36,14 @@ func Index(
 	}
 	w.Flush()
 
-	rs, total, err := getResultSet(store, limit, offset, list)
+	rs, total, err := getResultSet(store, limit, offset, reposList)
 	if err != nil {
 		logrus.WithField("err", err).Fatal("unable to get result set")
 	}
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt)
-	repos := processRepos(workers, txer, rs)
+	repos := processRepos(workers, txer, rs, reposList)
 	var processed int
 	for {
 		select {
@@ -88,15 +89,16 @@ func createOutputFile(outputFile string) (*os.File, error) {
 func getResultSet(
 	store *model.RepositoryStore,
 	limit, offset uint64,
-	list []string,
+	list map[string]uint32,
 ) (*model.RepositoryResultSet, int64, error) {
 	query := model.NewRepositoryQuery().
 		FindByStatus(model.Fetched).
 		WithReferences(nil)
 
+	const endpoint = "git://github.com/%s.git"
 	var repos = make([]interface{}, len(list))
-	for i, r := range list {
-		repos[i] = r
+	for repo := range list {
+		repos = append(repos, fmt.Sprintf(endpoint, repo))
 	}
 
 	if len(list) > 0 {

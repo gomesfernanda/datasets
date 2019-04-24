@@ -28,6 +28,12 @@ By default only the repository URL is displayed, but you can change that with th
 - `--format csv` (or `-f cvs`) will print CVS rows with all the details,
 - `--format json` (or `-f json`) will print do the same for JSON.
 
+The extended information includes the fields: `URL`, `SIVA_FILENAMES`, `FILE_COUNT`, `LANGS`,`LANGS_BYTE_COUNT`, `LANGS_LINES_COUNT`,`LANGS_FILES_COUNT`, `COMMITS_COUNT`, `BRANCHES_COUNT`, `FORK_COUNT`, `EMPTY_LINES_COUNT`, `CODE_LINES_COUNT`, `COMMENT_LINES_COUNT`, `LICENSE`, `STARS` and `SIZE`.
+
+Note that the fields `STARS` and `SIZE` can hold the value `-1` to point out that the index doesn't have information about those. This ensures compatibility between different index versions.
+
+`SIZE` represents the sum of the sizes of all the siva files you need to collect to get the complete repository. Because a siva file can hold several repositories information, when you need to download more than one repository the total amount of bytes to be downloaded will be at most the sum of their `SIZES` values though it could be less if they share any of the siva files.
+
 #### Filtering results
 
 You can now add some filters to decide which ones you want to see, for now we've implemented only two
@@ -51,7 +57,7 @@ Simply replace `list` with `get`! You also get a couple of extra flags.
 
 #### Downloading siva files given their names
 
-Simply pass a list of siva filenames through standad input to `pga get`.
+Simply pass a list of siva filenames through standard input to `pga get`.
 
 For instance, this command lists all of the repositories under github.com/src-d, filter out those with less than 50 files,
 and downloads the siva files with `pga get` to the `repositories` directory.

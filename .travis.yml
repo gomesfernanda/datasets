@@ -9,7 +9,7 @@ go:
   - 1.11.x
 
 before_install:
-  - go get -v github.com/golang/lint/golint
+  - go get -v -u golang.org/x/lint/golint
 
 script:
   - go vet ./...
@@ -62,6 +62,10 @@ jobs:
         skip_cleanup: true
         on:
           tags: true
+      after_deploy:
+        - cd $GOPATH/src/github.com/src-d/datasets/PublicGitArchive/pga-create/
+        - make docker-push-latest-release
 
 notifications:
   email: false
+
